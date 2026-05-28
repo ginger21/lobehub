@@ -21,13 +21,16 @@ import knowledgeBase from './knowledgeBase';
 import labs from './labs';
 import marketAuth from './marketAuth';
 import memory from './memory';
+import messenger from './messenger';
 import metadata from './metadata';
 import migration from './migration';
 import modelProvider from './modelProvider';
+import modelRuntime from './modelRuntime';
 import models from './models';
 import notification from './notification';
 import oauth from './oauth';
 import onboarding from './onboarding';
+import openInApp from './openInApp';
 import plugin from './plugin';
 import portal from './portal';
 import providers from './providers';
@@ -68,13 +71,16 @@ const resources = {
   labs,
   marketAuth,
   memory,
+  messenger,
   metadata,
   migration,
   modelProvider,
+  modelRuntime,
   models,
   notification,
   oauth,
   onboarding,
+  openInApp,
   plugin,
   portal,
   providers,

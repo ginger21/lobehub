@@ -1,4 +1,4 @@
-import { and, eq, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 
 import {
   agents,
@@ -133,6 +133,20 @@ export interface KnowledgeBaseSearchResult extends BaseSearchResult {
   type: 'knowledgeBase';
 }
 
+/**
+ * BM25 hit for KB-scoped documents (custom/document) used by chunkRouter.semanticSearchForChat.
+ * Distinct from PageSearchResult — this carries snippet + KB id for agent tool consumption.
+ * `relevance` is normalized to [1, 3] (lower = better, matches BaseSearchResult semantics).
+ */
+export interface KnowledgeBaseDocumentHit {
+  documentId: string;
+  knowledgeBaseId: string;
+  relevance: number;
+  snippet: string;
+  title: string;
+  updatedAt: Date;
+}
+
 export interface AssistantSearchResult extends BaseSearchResult {
   author: string;
   avatar?: string | null;
@@ -165,6 +179,14 @@ export interface SearchOptions {
   query: string;
   type?: SearchResultType;
 }
+
+/**
+ * Topics and messages are ordered by recency rather than BM25 score, so we fetch
+ * a larger candidate pool first (most relevant matches), then keep the most recent
+ * ones. This prevents newly created/updated items from being buried under older
+ * high-scoring matches that would otherwise fill the small per-type limit.
+ */
+const RECENCY_CANDIDATE_MULTIPLIER = 4;
 
 /**
  * Search Repository - provides unified search across Agents, Topics, and Files
@@ -225,10 +247,11 @@ export class SearchRepo {
 
     const results = await Promise.all(searchPromises);
 
-    // Flatten and sort by relevance ASC, then by updatedAt DESC
-    return results
-      .flat()
-      .sort((a, b) => a.relevance - b.relevance || b.updatedAt.getTime() - a.updatedAt.getTime());
+    // Each search method already returns its results in the intended display order
+    // (topics/messages by recency, other types by BM25 score). The command palette
+    // groups results by type, so we only need to preserve each type's internal order
+    // here rather than re-sorting the merged list by relevance.
+    return results.flat();
   }
 
   /**
@@ -439,27 +462,30 @@ export class SearchRepo {
         ),
       )
       .orderBy(sql`paradedb.score(${topics.id}) DESC`)
-      .limit(limit);
+      .limit(limit * RECENCY_CANDIDATE_MULTIPLIER);
 
-    return this.mapScoresToRelevance(rows).map((row) => ({
-      agent: row.agentMatchedId
-        ? {
-            avatar: row.agentAvatar,
-            backgroundColor: row.agentBackgroundColor,
-            title: row.agentTitle,
-          }
-        : null,
-      agentId: row.agentId,
-      createdAt: row.createdAt,
-      description: this.truncate(row.content),
-      favorite: row.favorite,
-      id: row.id,
-      relevance: row.relevance,
-      sessionId: row.sessionId,
-      title: row.title || '',
-      type: 'topic' as const,
-      updatedAt: row.updatedAt,
-    }));
+    return this.mapScoresToRelevance(rows)
+      .map((row) => ({
+        agent: row.agentMatchedId
+          ? {
+              avatar: row.agentAvatar,
+              backgroundColor: row.agentBackgroundColor,
+              title: row.agentTitle,
+            }
+          : null,
+        agentId: row.agentId,
+        createdAt: row.createdAt,
+        description: this.truncate(row.content),
+        favorite: row.favorite,
+        id: row.id,
+        relevance: row.relevance,
+        sessionId: row.sessionId,
+        title: row.title || '',
+        type: 'topic' as const,
+        updatedAt: row.updatedAt,
+      }))
+      .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+      .slice(0, limit);
   }
 
   /**
@@ -496,22 +522,25 @@ export class SearchRepo {
         ),
       )
       .orderBy(sql`paradedb.score(${messages.id}) DESC`)
-      .limit(limit);
+      .limit(limit * RECENCY_CANDIDATE_MULTIPLIER);
 
-    return this.mapScoresToRelevance(rows).map((row) => ({
-      agentId: row.agentId,
-      content: row.content || '',
-      createdAt: row.createdAt,
-      description: row.agentTitle || 'General Chat',
-      id: row.id,
-      model: row.model,
-      relevance: row.relevance,
-      role: row.role,
-      title: this.truncate(row.content) || '',
-      topicId: row.topicId,
-      type: 'message' as const,
-      updatedAt: row.updatedAt,
-    }));
+    return this.mapScoresToRelevance(rows)
+      .map((row) => ({
+        agentId: row.agentId,
+        content: row.content || '',
+        createdAt: row.createdAt,
+        description: row.agentTitle || 'General Chat',
+        id: row.id,
+        model: row.model,
+        relevance: row.relevance,
+        role: row.role,
+        title: this.truncate(row.content) || '',
+        topicId: row.topicId,
+        type: 'message' as const,
+        updatedAt: row.updatedAt,
+      }))
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, limit);
   }
 
   /**
@@ -647,6 +676,53 @@ export class SearchRepo {
         updatedAt: row.updatedAt,
       };
     });
+  }
+
+  /**
+   * KB-scoped BM25 search over custom/document documents.
+   * Used by chunkRouter.semanticSearchForChat to surface inline documents
+   * to the KB agent tool's searchKnowledgeBase API.
+   */
+  async searchKnowledgeBaseDocuments(
+    query: string,
+    knowledgeBaseIds: string[],
+    limit: number = 20,
+  ): Promise<KnowledgeBaseDocumentHit[]> {
+    if (!query || query.trim() === '') return [];
+    if (!knowledgeBaseIds || knowledgeBaseIds.length === 0) return [];
+
+    const bm25Query = sanitizeBm25Query(query);
+
+    const rows = await this.db
+      .select({
+        content: documents.content,
+        filename: documents.filename,
+        id: documents.id,
+        knowledgeBaseId: documents.knowledgeBaseId,
+        score: sql<number>`paradedb.score(${documents.id})`,
+        title: documents.title,
+        updatedAt: documents.updatedAt,
+      })
+      .from(documents)
+      .where(
+        and(
+          eq(documents.userId, this.userId),
+          eq(documents.fileType, 'custom/document'),
+          inArray(documents.knowledgeBaseId, knowledgeBaseIds),
+          sql`(${documents.title} @@@ ${bm25Query} OR ${documents.slug} @@@ ${bm25Query} OR ${documents.content} @@@ ${bm25Query})`,
+        ),
+      )
+      .orderBy(sql`paradedb.score(${documents.id}) DESC`)
+      .limit(limit);
+
+    return this.mapScoresToRelevance(rows).map((row) => ({
+      documentId: row.id,
+      knowledgeBaseId: row.knowledgeBaseId ?? '',
+      relevance: row.relevance,
+      snippet: this.truncate(row.content, 300) ?? '',
+      title: row.title || row.filename || 'Untitled',
+      updatedAt: row.updatedAt,
+    }));
   }
 
   /**

@@ -54,6 +54,9 @@ export const responsesAPIModels = new Set([
   'gpt-5.5-pro',
 ]);
 
+export const isGPT5ProResponsesModel = (model: string): boolean =>
+  /(?:^|\/)gpt-5(?:\.\d+)?-pro(?:-|$)/.test(model);
+
 /**
  * Regex patterns for models that support context caching (3.5+)
  */
@@ -135,4 +138,13 @@ export const omitSamplingParamsModelPatterns: RegExp[] = [
 
 export const shouldOmitSamplingParams = (model: string): boolean => {
   return omitSamplingParamsModelPatterns.some((pattern) => pattern.test(model));
+};
+
+export const assistantPrefillUnsupportedModelPatterns: RegExp[] = [
+  /^claude-(opus|sonnet)-4-(6|7)(\b|-)/,
+  /anthropic\.claude-(opus|sonnet)-4-(6|7)(\b|-)/,
+];
+
+export const shouldDropUnsupportedClaudeAssistantPrefill = (model: string): boolean => {
+  return assistantPrefillUnsupportedModelPatterns.some((pattern) => pattern.test(model));
 };

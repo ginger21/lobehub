@@ -44,6 +44,16 @@ export interface ToolCallResponseMessage {
   type: 'tool_call_response';
 }
 
+export interface MessageApiResponseMessage {
+  requestId: string;
+  result: {
+    content: string;
+    error?: string;
+    success: boolean;
+  };
+  type: 'message_api_response';
+}
+
 // Server → Client
 export interface HeartbeatAckMessage {
   type: 'heartbeat_ack';
@@ -72,6 +82,16 @@ export interface ToolCallRequestMessage {
   type: 'tool_call_request';
 }
 
+export interface MessageApiRequestMessage {
+  api: {
+    apiName: string;
+    payload: Record<string, unknown>;
+    platform: string;
+  };
+  requestId: string;
+  type: 'message_api_request';
+}
+
 // Server → Client
 export interface SystemInfoRequestMessage {
   requestId: string;
@@ -88,16 +108,40 @@ export interface SystemInfoResponseMessage {
   type: 'system_info_response';
 }
 
+/** Server → Client: request the desktop to spawn `lh hetero exec`. */
+export interface AgentRunRequestMessage {
+  agentType: string;
+  cwd?: string;
+  jwt: string;
+  operationId: string;
+  prompt: string;
+  resumeSessionId?: string;
+  topicId: string;
+  type: 'agent_run_request';
+}
+
+/** Client → Server: acknowledgement for an agent_run_request. */
+export interface AgentRunAckMessage {
+  operationId: string;
+  reason?: string;
+  status: 'accepted' | 'rejected';
+  type: 'agent_run_ack';
+}
+
 export type ClientMessage =
+  | AgentRunAckMessage
   | AuthMessage
   | HeartbeatMessage
+  | MessageApiResponseMessage
   | SystemInfoResponseMessage
   | ToolCallResponseMessage;
 export type ServerMessage =
+  | AgentRunRequestMessage
   | AuthExpiredMessage
   | AuthFailedMessage
   | AuthSuccessMessage
   | HeartbeatAckMessage
+  | MessageApiRequestMessage
   | SystemInfoRequestMessage
   | ToolCallRequestMessage;
 
@@ -111,12 +155,14 @@ export type ConnectionStatus =
   | 'reconnecting';
 
 export interface GatewayClientEvents {
+  agent_run_request: (request: AgentRunRequestMessage) => void;
   auth_expired: () => void;
   auth_failed: (reason: string) => void;
   connected: () => void;
   disconnected: () => void;
   error: (error: Error) => void;
   heartbeat_ack: () => void;
+  message_api_request: (request: MessageApiRequestMessage) => void;
   reconnecting: (delay: number) => void;
   status_changed: (status: ConnectionStatus) => void;
   system_info_request: (request: SystemInfoRequestMessage) => void;

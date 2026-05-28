@@ -5,9 +5,13 @@ import os from 'node:os';
 import WebSocket from 'ws';
 
 import type {
+  AgentRunAckMessage,
+  AgentRunRequestMessage,
   ClientMessage,
   ConnectionStatus,
   GatewayClientEvents,
+  MessageApiRequestMessage,
+  MessageApiResponseMessage,
   ServerMessage,
   SystemInfoRequestMessage,
   SystemInfoResponseMessage,
@@ -144,10 +148,24 @@ export class GatewayClient extends EventEmitter {
     });
   }
 
+  sendMessageApiResponse(response: Omit<MessageApiResponseMessage, 'type'>): void {
+    this.sendMessage({
+      ...response,
+      type: 'message_api_response',
+    });
+  }
+
   sendSystemInfoResponse(response: Omit<SystemInfoResponseMessage, 'type'>): void {
     this.sendMessage({
       ...response,
       type: 'system_info_response',
+    });
+  }
+
+  sendAgentRunAck(response: Omit<AgentRunAckMessage, 'type'>): void {
+    this.sendMessage({
+      ...response,
+      type: 'agent_run_ack',
     });
   }
 
@@ -247,8 +265,18 @@ export class GatewayClient extends EventEmitter {
           break;
         }
 
+        case 'message_api_request': {
+          this.emit('message_api_request', message as MessageApiRequestMessage);
+          break;
+        }
+
         case 'system_info_request': {
           this.emit('system_info_request', message as SystemInfoRequestMessage);
+          break;
+        }
+
+        case 'agent_run_request': {
+          this.emit('agent_run_request', message as AgentRunRequestMessage);
           break;
         }
 

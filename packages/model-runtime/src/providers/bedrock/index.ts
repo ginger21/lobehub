@@ -7,6 +7,13 @@ import {
 import { cloudModelIdMapping } from '@lobechat/business-const';
 import { ModelProvider } from 'model-bank';
 
+import { shouldDropUnsupportedClaudeAssistantPrefill } from '../../const/models';
+import type { AnthropicGenerateObjectResponse } from '../../core/anthropicCompatibleFactory/generateObject';
+import {
+  buildAnthropicGenerateObjectRequest,
+  emitAnthropicGenerateObjectUsage,
+  parseAnthropicGenerateObjectResponse,
+} from '../../core/anthropicCompatibleFactory/generateObject';
 import { resolveCacheTTL } from '../../core/anthropicCompatibleFactory/resolveCacheTTL';
 import { resolveMaxTokens } from '../../core/anthropicCompatibleFactory/resolveMaxTokens';
 import type { LobeRuntimeAI } from '../../core/BaseAI';
@@ -17,19 +24,22 @@ import {
   AWSBedrockLlamaStream,
   createBedrockStream,
 } from '../../core/streams';
+import { ErrorClassifier } from '../../errors';
 import type {
   ChatMethodOptions,
   ChatStreamPayload,
   Embeddings,
   EmbeddingsOptions,
   EmbeddingsPayload,
+  GenerateObjectOptions,
+  GenerateObjectPayload,
 } from '../../types';
 import { AgentRuntimeErrorType } from '../../types/error';
 import { AgentRuntimeError } from '../../utils/createError';
 import { debugStream } from '../../utils/debugStream';
 import { getModelPricing } from '../../utils/getModelPricing';
-import { isExceededContextWindowError } from '../../utils/isExceededContextWindowError';
 import { StreamingResponse } from '../../utils/response';
+import { normalizeClaudeThinkingHistoryMessages } from '../anthropic/claudeThinkingHistory';
 
 /**
  * A prompt constructor for HuggingFace LLama 2 chat models.
@@ -122,6 +132,71 @@ export class LobeBedrockAI implements LobeRuntimeAI {
     return Promise.all(promises);
   }
 
+  async generateObject(payload: GenerateObjectPayload, options?: GenerateObjectOptions) {
+    return this.invokeClaudeGenerateObject(payload, options);
+  }
+
+  private invokeClaudeGenerateObject = async (
+    payload: GenerateObjectPayload,
+    options?: GenerateObjectOptions,
+  ) => {
+    const { bedrock: bedrockModels } = await import('model-bank');
+    const resolvedMaxTokens = await resolveMaxTokens({
+      model: payload.model,
+      providerModels: bedrockModels,
+      thinking: payload.thinking,
+    });
+    const systemMessages = payload.messages.filter((m) => m.role === 'system');
+    const normalizedMessages = normalizeClaudeThinkingHistoryMessages(
+      payload.messages.filter((m) => m.role !== 'system') as ChatStreamPayload['messages'],
+    ) as GenerateObjectPayload['messages'];
+    const { requestParams, schemaToolName } = await buildAnthropicGenerateObjectRequest(
+      { ...payload, messages: [...systemMessages, ...normalizedMessages] },
+      { maxTokens: resolvedMaxTokens },
+    );
+    const bedrockRequestParams: Omit<Anthropic.MessageCreateParams, 'model'> & {
+      model?: Anthropic.MessageCreateParams['model'];
+    } = { ...requestParams };
+    delete bedrockRequestParams.model;
+
+    const command = new InvokeModelCommand({
+      accept: 'application/json',
+      body: JSON.stringify({
+        anthropic_version: 'bedrock-2023-05-31',
+        ...bedrockRequestParams,
+      }),
+      contentType: 'application/json',
+      modelId: cloudModelIdMapping[payload.model] || payload.model,
+    });
+
+    try {
+      const [res, pricing] = await Promise.all([
+        this.client.send(command, { abortSignal: options?.signal }),
+        getModelPricing(payload.model, this.id),
+      ]);
+      const responseBody = JSON.parse(
+        new TextDecoder().decode(res.body),
+      ) as AnthropicGenerateObjectResponse;
+
+      await emitAnthropicGenerateObjectUsage(responseBody, options, pricing);
+
+      return parseAnthropicGenerateObjectResponse(responseBody, schemaToolName);
+    } catch (e) {
+      const err = e as Error & { $metadata: any };
+
+      throw AgentRuntimeError.chat({
+        error: {
+          body: err.$metadata,
+          message: err.message,
+          type: err.name,
+        },
+        errorType: AgentRuntimeErrorType.ProviderBizError,
+        provider: this.id,
+        region: this.region,
+      });
+    }
+  };
+
   private invokeEmbeddingModel = async (
     payload: EmbeddingsPayload,
     options?: EmbeddingsOptions,
@@ -172,7 +247,9 @@ export class LobeBedrockAI implements LobeRuntimeAI {
     } = payload;
     const inputStartAt = Date.now();
     const system_message = messages.find((m) => m.role === 'system');
-    const user_messages = messages.filter((m) => m.role !== 'system');
+    const user_messages = normalizeClaudeThinkingHistoryMessages(
+      messages.filter((m) => m.role !== 'system'),
+    );
     // Filter out empty/whitespace-only system prompts — Anthropic API rejects them
     const systemPromptText =
       typeof system_message?.content === 'string' && system_message.content.trim()
@@ -204,8 +281,10 @@ export class LobeBedrockAI implements LobeRuntimeAI {
 
     const postMessages = await buildAnthropicMessages(user_messages, { enabledContextCaching });
 
-    // Claude 4.6 models do not support assistant turn prefill
-    if (model.includes('-4-6') && postMessages.at(-1)?.role === 'assistant') {
+    if (
+      shouldDropUnsupportedClaudeAssistantPrefill(model) &&
+      postMessages.at(-1)?.role === 'assistant'
+    ) {
       postMessages.pop();
     }
 
@@ -285,7 +364,7 @@ export class LobeBedrockAI implements LobeRuntimeAI {
       );
     } catch (e) {
       const err = e as Error & { $metadata: any };
-      const errorType = isExceededContextWindowError(err.message)
+      const errorType = ErrorClassifier.isExceededContextWindow(err.message)
         ? AgentRuntimeErrorType.ExceededContextWindow
         : AgentRuntimeErrorType.ProviderBizError;
 

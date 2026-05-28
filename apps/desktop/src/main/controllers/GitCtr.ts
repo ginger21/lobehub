@@ -1,21 +1,26 @@
 import { execFile, spawn } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 import type {
+  GetGitBranchDiffPayload,
   GitAheadBehind,
+  GitBranchDiffPatches,
   GitBranchInfo,
   GitBranchListItem,
   GitCheckoutResult,
   GitFileDiffStatus,
+  GitFileRevertResult,
   GitLinkedPullRequestResult,
   GitPullResult,
   GitPushResult,
+  GitRemoteBranchListItem,
   GitWorkingTreeFiles,
   GitWorkingTreePatch,
   GitWorkingTreePatches,
   GitWorkingTreeStatus,
+  SubmoduleWorkingTreePatches,
 } from '@lobechat/electron-client-ipc';
 
 import { detectRepoType, resolveGitDir } from '@/utils/git';
@@ -150,6 +155,21 @@ export const quoteGitPath = (prefix: 'a/' | 'b/', filePath: string): string => {
     }
   }
   return out + '"';
+};
+
+/**
+ * Status from a single diff block's preamble: `new file mode` → added,
+ * `deleted file mode` → deleted, otherwise modified. Used by branch-diff mode
+ * where there's no `git status` to consult — the diff itself is the source.
+ */
+const detectDiffBlockStatus = (block: string): GitFileDiffStatus => {
+  // Only scan up to the first hunk / binary marker so huge bodies aren't walked.
+  for (const line of block.split('\n')) {
+    if (line.startsWith('new file mode ')) return 'added';
+    if (line.startsWith('deleted file mode ')) return 'deleted';
+    if (line.startsWith('@@') || line.startsWith('Binary files ')) break;
+  }
+  return 'modified';
 };
 
 /** Walk a patch counting `+`/`-` lines while skipping `+++`/`---` headers. */
@@ -557,6 +577,54 @@ export default class GitController extends ControllerModule {
   }
 
   /**
+   * List remote branches under `refs/remotes/origin/*`, ordered by most
+   * recent commit. The `HEAD` symref is filtered out and the resolved
+   * default branch is flagged via `isDefault` so the UI can render it
+   * with a marker. Used by the Review panel's branch-compare picker.
+   */
+  @IpcMethod()
+  async listGitRemoteBranches(dirPath: string): Promise<GitRemoteBranchListItem[]> {
+    const execFileAsync = promisify(execFile);
+    let defaultRef: string | undefined;
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+        { cwd: dirPath, timeout: 5000 },
+      );
+      defaultRef = stdout.trim() || undefined;
+    } catch {
+      defaultRef = undefined;
+    }
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        [
+          'for-each-ref',
+          '--sort=-committerdate',
+          '--format=%(refname:short)',
+          'refs/remotes/origin',
+        ],
+        { cwd: dirPath, timeout: 5000 },
+      );
+      return stdout
+        .replaceAll('\r', '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((name) => name.length > 0 && name !== 'origin/HEAD' && !name.endsWith('/HEAD'))
+        .map((name) => ({ isDefault: name === defaultRef, name }));
+    } catch (error: any) {
+      logger.warn('[listGitRemoteBranches] git command failed', {
+        code: error?.code,
+        cwd: dirPath,
+        message: error?.message,
+        stderr: error?.stderr?.toString?.() ?? error?.stderr,
+      });
+      return [];
+    }
+  }
+
+  /**
    * Bucket dirty files into added / modified / deleted via `git status --porcelain -z`.
    * Each file is counted once: untracked (`??`) and staged-add (`A`) → added,
    * any `D` in index or working tree → deleted, everything else (`M`/`R`/`C`/`T`/`U`) → modified.
@@ -672,9 +740,73 @@ export default class GitController extends ControllerModule {
    *
    * Per-file patches are capped at 256 KB; oversized or binary entries get an
    * empty `patch` string and a flag the renderer can use for a placeholder.
+   *
+   * Dirty submodules are detected via `git submodule status` and surfaced as
+   * grouped `submodules[]` entries — their internal patches live under each
+   * group, not in the parent's flat `patches` list. Nested submodules are not
+   * traversed (phase 1).
    */
   @IpcMethod()
   async getGitWorkingTreePatches(dirPath: string): Promise<GitWorkingTreePatches> {
+    return this.collectWorkingTreePatches(dirPath, true);
+  }
+
+  /**
+   * List paths of initialized submodules registered in `dirPath`. Uninitialized
+   * entries (`-` prefix in `git submodule status`) are skipped — there's no
+   * working tree to inspect for those. Failures (no submodules, shell errors)
+   * return an empty set so callers gracefully fall back to the flat layout.
+   *
+   * Only direct submodules are listed; nested submodules would need
+   * `--recursive` plus a tree-aware renderer we don't have in phase 1.
+   */
+  private async listSubmodulePaths(dirPath: string): Promise<Set<string>> {
+    const execFileAsync = promisify(execFile);
+    try {
+      const { stdout } = await execFileAsync('git', ['submodule', 'status'], {
+        cwd: dirPath,
+        timeout: 5000,
+      });
+      const paths = new Set<string>();
+      for (const line of stdout.split('\n')) {
+        if (line.length < 2) continue;
+        // Status char: ' ' (clean), '+' (modified content), '-' (uninit), 'U' (conflict).
+        if (line[0] === '-') continue;
+        // Format: "<status><sha> <path>[ (<describe>)]". Parse via string ops
+        // rather than a single regex — combining `\s+` separators with a
+        // greedy/lazy path capture trips eslint's ReDoS rule.
+        const rest = line.slice(1);
+        const firstSpace = rest.indexOf(' ');
+        if (firstSpace < 0) continue;
+        const sha = rest.slice(0, firstSpace);
+        if (!/^[\da-f]{7,40}$/.test(sha)) continue;
+        let path = rest.slice(firstSpace + 1);
+        // Drop the trailing ` (<describe>)` suffix when present.
+        if (path.endsWith(')')) {
+          const describeStart = path.lastIndexOf(' (');
+          if (describeStart > 0) path = path.slice(0, describeStart);
+        }
+        if (path) paths.add(path);
+      }
+      return paths;
+    } catch (error: any) {
+      logger.debug('[listSubmodulePaths] failed', {
+        cwd: dirPath,
+        stderr: error?.stderr?.toString?.() ?? error?.stderr,
+      });
+      return new Set();
+    }
+  }
+
+  /**
+   * Shared implementation for working-tree patch collection. The IPC entry
+   * passes `recurseSubmodules: true`; recursive calls into each submodule pass
+   * `false` to avoid traversing nested submodules (phase 1).
+   */
+  private async collectWorkingTreePatches(
+    dirPath: string,
+    recurseSubmodules: boolean,
+  ): Promise<GitWorkingTreePatches> {
     const MAX_PATCH_BYTES = 256 * 1024;
     const execFileAsync = promisify(execFile);
 
@@ -684,10 +816,19 @@ export default class GitController extends ControllerModule {
       status: GitFileDiffStatus;
     }
 
+    // Step 0 — when recursion is enabled, learn which paths in the parent's
+    // status are submodule roots. Their internal diffs are collected separately
+    // (see Step 4) so we filter them out of the parent's flat patch list.
+    const submodulePaths = recurseSubmodules
+      ? await this.listSubmodulePaths(dirPath)
+      : new Set<string>();
+
     // Step 1 — classify every dirty path. Mirrors getGitWorkingTreeFiles but
     // also distinguishes untracked (`??`) from staged-add (`A`) so we can pick
-    // the right path (git diff vs raw read) per entry.
+    // the right path (git diff vs raw read) per entry. Submodule entries are
+    // siphoned into `submoduleDirtyEntries` for separate recursion in Step 4.
     const entries: Entry[] = [];
+    const submoduleDirtyEntries: Entry[] = [];
     try {
       const { stdout } = await execFileAsync('git', ['status', '--porcelain', '-z'], {
         cwd: dirPath,
@@ -705,20 +846,27 @@ export default class GitController extends ControllerModule {
         // R/C entries carry an extra source-path token we must consume.
         if (x === 'R' || x === 'C') i++;
         if (!filePath) continue;
+        let parsed: Entry | null = null;
         if (x === '?' && y === '?') {
-          entries.push({ filePath, isUntracked: true, status: 'added' });
+          parsed = { filePath, isUntracked: true, status: 'added' };
         } else if (x === '!' && y === '!') {
           // ignored
         } else if (x === 'D' || y === 'D') {
-          entries.push({ filePath, isUntracked: false, status: 'deleted' });
+          parsed = { filePath, isUntracked: false, status: 'deleted' };
         } else if (x === 'A' || y === 'A') {
-          entries.push({ filePath, isUntracked: false, status: 'added' });
+          parsed = { filePath, isUntracked: false, status: 'added' };
         } else {
-          entries.push({ filePath, isUntracked: false, status: 'modified' });
+          parsed = { filePath, isUntracked: false, status: 'modified' };
+        }
+        if (!parsed) continue;
+        if (submodulePaths.has(filePath)) {
+          submoduleDirtyEntries.push(parsed);
+        } else {
+          entries.push(parsed);
         }
       }
     } catch (error: any) {
-      logger.warn('[getGitWorkingTreePatches] status failed', {
+      logger.warn('[collectWorkingTreePatches] status failed', {
         cwd: dirPath,
         stderr: error?.stderr?.toString?.() ?? error?.stderr,
       });
@@ -751,7 +899,7 @@ export default class GitController extends ControllerModule {
           30_000,
         );
       } catch (error: any) {
-        logger.warn('[getGitWorkingTreePatches] bulk diff failed; per-file fallback', {
+        logger.warn('[collectWorkingTreePatches] bulk diff failed; per-file fallback', {
           cwd: dirPath,
           stderr: error?.stderr?.toString?.() ?? error?.stderr,
         });
@@ -788,7 +936,188 @@ export default class GitController extends ControllerModule {
     const allPatches: GitWorkingTreePatch[] = [...trackedPatches.values(), ...untrackedPatches];
     allPatches.sort((a, b) => order[a.status] - order[b.status]);
 
-    return { patches: allPatches };
+    // Step 4 — for each dirty submodule, recurse for its own patches + branch.
+    // We only descend one level (`recurseSubmodules: false` on the inner call)
+    // because phase 1's UI groups direct children; nested submodules would
+    // need a tree view we don't have yet. Empty groups (pointer-only bumps)
+    // are kept so the user still sees the submodule surfaced in the panel.
+    let submodules: SubmoduleWorkingTreePatches[] | undefined;
+    if (submoduleDirtyEntries.length > 0) {
+      submodules = await Promise.all(
+        submoduleDirtyEntries.map(async (entry) => {
+          const absolutePath = path.resolve(dirPath, entry.filePath);
+          const [sub, branchInfo] = await Promise.all([
+            this.collectWorkingTreePatches(absolutePath, false),
+            this.getGitBranch(absolutePath),
+          ]);
+          return {
+            absolutePath,
+            branch: branchInfo.branch,
+            detached: branchInfo.detached,
+            name: path.basename(entry.filePath),
+            patches: sub.patches,
+            relativePath: entry.filePath,
+          };
+        }),
+      );
+    }
+
+    return { patches: allPatches, submodules };
+  }
+
+  /**
+   * Diff every changed file between the current HEAD and the remote default
+   * branch (resolved via `refs/remotes/origin/HEAD` — typically `origin/main`
+   * or `origin/canary`). Uses `<base>...HEAD` so the result is "what this
+   * branch added since it forked", ignoring upstream-only commits.
+   *
+   * Best-effort `git fetch` first so the comparison reflects the latest
+   * remote state; fetch failures (offline / no creds / no `origin`) are
+   * swallowed and we fall back to whatever cached refs exist. Returns
+   * `baseRef: undefined` + empty patches when no remote default is set —
+   * the renderer surfaces a "noBaseRef" hint in that case.
+   *
+   * Patch parsing reuses the same bulk-split + size-cap path as the working
+   * tree variant; status comes from each diff block's preamble (no `git
+   * status` cross-reference needed since every block is from history).
+   */
+  @IpcMethod()
+  async getGitBranchDiff(payload: GetGitBranchDiffPayload): Promise<GitBranchDiffPatches> {
+    return this.collectBranchDiff(payload.path, payload.baseRef, true);
+  }
+
+  /**
+   * Shared implementation for branch-diff collection. The IPC entry passes
+   * `recurseSubmodules: true`; recursive calls into each submodule pass
+   * `false` to avoid traversing nested submodules (phase 1). Each submodule's
+   * base ref is resolved independently — we don't try to derive it from the
+   * parent's base because (a) the parent's submodule pointer may not exist
+   * as a branch ref inside the submodule and (b) "this submodule's branch
+   * vs its own remote default" is what users typically want.
+   */
+  private async collectBranchDiff(
+    dirPath: string,
+    baseRefOverride: string | undefined,
+    recurseSubmodules: boolean,
+  ): Promise<GitBranchDiffPatches> {
+    const MAX_PATCH_BYTES = 256 * 1024;
+    const execFileAsync = promisify(execFile);
+
+    // Step 1 — best-effort fetch so origin/<default> reflects remote HEAD.
+    try {
+      await execFileAsync('git', ['fetch', '--no-tags', '--quiet', 'origin'], {
+        cwd: dirPath,
+        timeout: 10_000,
+      });
+    } catch {
+      // swallow — fall through to cached refs
+    }
+
+    // Step 2 — pick the comparison base. When the caller passes an explicit
+    // override (e.g. user picked a non-default branch in the UI) we trust it;
+    // otherwise we resolve `refs/remotes/origin/HEAD`. The default may be
+    // missing on repos cloned with --no-checkout or after a remote rename —
+    // surface a "noBaseRef" empty state in that case so the user can run
+    // `git remote set-head origin --auto` themselves.
+    let baseRef: string | undefined = baseRefOverride;
+    if (!baseRef) {
+      try {
+        const { stdout } = await execFileAsync(
+          'git',
+          ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+          { cwd: dirPath, timeout: 5000 },
+        );
+        baseRef = stdout.trim() || undefined;
+      } catch {
+        baseRef = undefined;
+      }
+    }
+
+    // headRef populated even when baseRef is missing so the UI can still
+    // surface "fix/foo ← ?" instead of going completely blank.
+    const headRef = (await this.getGitBranch(dirPath)).branch;
+
+    if (!baseRef) {
+      return { headRef, patches: [] };
+    }
+
+    // Step 3 — single bulk diff against the merge base. Three-dot semantics
+    // (`base...HEAD`) ignore commits added to base after the branch forked,
+    // matching what users expect from "compare branch" UI on GitHub. Stream
+    // capture mirrors the working-tree path so multi-MB diffs land intact.
+    let bulkDiff = '';
+    try {
+      bulkDiff = await runGitCaptureStream(
+        dirPath,
+        ['-c', 'core.quotepath=off', 'diff', '--no-color', `${baseRef}...HEAD`],
+        30_000,
+      );
+    } catch (error: any) {
+      logger.warn('[collectBranchDiff] diff failed', {
+        baseRef,
+        cwd: dirPath,
+        stderr: error?.stderr?.toString?.() ?? error?.stderr,
+      });
+      if (typeof error?.partialStdout === 'string') bulkDiff = error.partialStdout;
+    }
+
+    // Step 4 — split per-file. When submodule recursion is enabled, peel out
+    // any pointer-bump entries (block path matches a registered submodule)
+    // into `pointerBumpPaths`; we'll surface those groups unconditionally in
+    // Step 5 even if the submodule's own branch is clean.
+    const submodulePaths = recurseSubmodules
+      ? await this.listSubmodulePaths(dirPath)
+      : new Set<string>();
+    const patches: GitWorkingTreePatch[] = [];
+    const pointerBumpPaths = new Set<string>();
+    for (const block of splitBulkDiff(bulkDiff)) {
+      if (submodulePaths.has(block.path)) {
+        pointerBumpPaths.add(block.path);
+        continue;
+      }
+      const status = detectDiffBlockStatus(block.patch);
+      patches.push(buildTrackedPatch({ filePath: block.path, status }, block, MAX_PATCH_BYTES));
+    }
+
+    const order: Record<GitFileDiffStatus, number> = { added: 0, modified: 1, deleted: 2 };
+    patches.sort((a, b) => order[a.status] - order[b.status]);
+
+    // Step 5 — recurse for EVERY registered submodule (not just those with
+    // pointer-bumps) so we also surface submodules whose own branch diverges
+    // from its own origin/HEAD even when the parent's pointer is unchanged.
+    // Single-level only (`recurseSubmodules: false` on the inner call). A
+    // group is kept when EITHER its pointer changed in the parent OR its own
+    // branch diff has at least one patch; submodules that are clean on both
+    // axes are dropped to keep the panel quiet. Submodule count is expected
+    // to be small (single digits in practice), so per-submodule fetch + diff
+    // in parallel is acceptable.
+    let submodules: SubmoduleWorkingTreePatches[] | undefined;
+    if (submodulePaths.size > 0) {
+      const candidates = await Promise.all(
+        Array.from(submodulePaths).map(async (relativePath) => {
+          const absolutePath = path.resolve(dirPath, relativePath);
+          const [sub, branchInfo] = await Promise.all([
+            this.collectBranchDiff(absolutePath, undefined, false),
+            this.getGitBranch(absolutePath),
+          ]);
+          return {
+            group: {
+              absolutePath,
+              branch: branchInfo.branch,
+              detached: branchInfo.detached,
+              name: path.basename(relativePath),
+              patches: sub.patches,
+              relativePath,
+            },
+            keep: pointerBumpPaths.has(relativePath) || sub.patches.length > 0,
+          };
+        }),
+      );
+      const filtered = candidates.filter((c) => c.keep).map((c) => c.group);
+      if (filtered.length > 0) submodules = filtered;
+    }
+
+    return { baseRef, headRef, patches, submodules };
   }
 
   /**
@@ -945,6 +1274,72 @@ export default class GitController extends ControllerModule {
       const stderr: string = (error?.stderr ?? error?.message ?? '').toString().trim();
       logger.debug('[pushGitBranch] failed', { stderr });
       return { error: stderr || 'git push failed', success: false };
+    }
+  }
+
+  /**
+   * Revert a single working-tree change. Mirrors what "Discard changes" does
+   * in GitHub Desktop / VSCode SCM: restore the file to its HEAD state,
+   * dropping any unstaged / staged edits — and physically delete the file
+   * when it doesn't exist at HEAD (untracked or staged-add).
+   *
+   * Branch logic by HEAD presence:
+   *  - present at HEAD  → `git checkout HEAD -- <file>` (covers modified,
+   *    deleted, staged-D — restores both index + worktree from HEAD)
+   *  - absent at HEAD   → `git rm --cached` (unstage if staged-A; silent
+   *    no-op for untracked) + `fs.rm` to delete the file from disk
+   *
+   * filePath is the repo-relative path from `git status` output, the same
+   * shape we hand to the renderer in `GitWorkingTreePatch.filePath`. We
+   * reject absolute paths and `..` traversal so the renderer can't poke
+   * outside the repo even if its payload were tampered with.
+   */
+  @IpcMethod()
+  async revertGitFile(payload: { filePath: string; path: string }): Promise<GitFileRevertResult> {
+    const { path: dirPath, filePath } = payload;
+    if (!filePath?.trim()) return { error: 'File path is required', success: false };
+    if (path.isAbsolute(filePath) || filePath.split(/[/\\]/).includes('..')) {
+      return { error: `Invalid file path: ${filePath}`, success: false };
+    }
+
+    const execFileAsync = promisify(execFile);
+
+    // Probe HEAD via cat-file -e — exit 0 means the blob exists at HEAD.
+    let existsAtHead: boolean;
+    try {
+      await execFileAsync('git', ['cat-file', '-e', `HEAD:${filePath}`], {
+        cwd: dirPath,
+        timeout: 5000,
+      });
+      existsAtHead = true;
+    } catch {
+      existsAtHead = false;
+    }
+
+    try {
+      if (existsAtHead) {
+        await execFileAsync('git', ['checkout', 'HEAD', '--', filePath], {
+          cwd: dirPath,
+          timeout: 15_000,
+        });
+      } else {
+        // Unstage if the file is in the index (staged-add). `git rm --cached`
+        // exits non-zero on untracked paths, which is fine — swallow it.
+        try {
+          await execFileAsync('git', ['rm', '--cached', '--quiet', '--', filePath], {
+            cwd: dirPath,
+            timeout: 5000,
+          });
+        } catch {
+          // not staged — fall through to the disk-delete
+        }
+        await rm(path.resolve(dirPath, filePath), { force: true, recursive: false });
+      }
+      return { success: true };
+    } catch (error: any) {
+      const stderr: string = (error?.stderr ?? error?.message ?? '').toString().trim();
+      logger.debug('[revertGitFile] failed', { filePath, stderr });
+      return { error: stderr || 'git revert failed', success: false };
     }
   }
 }

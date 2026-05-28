@@ -10,7 +10,9 @@ import NavHeader from '@/features/NavHeader';
 import { useAgentStore } from '@/store/agent';
 
 import { BOT_RUNTIME_STATUSES, type BotRuntimeStatus } from '../../../../types/botRuntimeStatus';
+import { type ChannelPlatformDefinition, COMING_SOON_PLATFORMS } from './const';
 import PlatformDetail from './detail';
+import ComingSoonDetail from './detail/ComingSoon';
 import PlatformList from './list';
 
 const styles = createStaticStyles(({ css }) => ({
@@ -45,8 +47,18 @@ const ChannelPage = memo(() => {
 
   const isLoading = platformsLoading || providersLoading;
 
+  // Merge server-side platforms with frontend-only coming-soon entries.
+  // Coming-soon wins over a server-registered platform with the same id: this
+  // lets the server roll out a platform safely (registering it on the server
+  // first) while the frontend keeps the placeholder until it's ready to ship —
+  // dropping the entry from COMING_SOON_PLATFORMS reveals the real platform.
+  const allPlatforms = useMemo<ChannelPlatformDefinition[]>(() => {
+    const comingSoonIds = new Set(COMING_SOON_PLATFORMS.map((p) => p.id));
+    return [...(platforms ?? []).filter((p) => !comingSoonIds.has(p.id)), ...COMING_SOON_PLATFORMS];
+  }, [platforms]);
+
   // Default to first platform once loaded
-  const effectiveActiveId = activeProviderId || platforms?.[0]?.id || '';
+  const effectiveActiveId = activeProviderId || allPlatforms[0]?.id || '';
 
   const platformRuntimeStatuses = useMemo(
     () =>
@@ -63,8 +75,8 @@ const ChannelPage = memo(() => {
   );
 
   const activePlatformDef = useMemo(
-    () => platforms?.find((p) => p.id === effectiveActiveId) || platforms?.[0],
-    [platforms, effectiveActiveId],
+    () => allPlatforms.find((p) => p.id === effectiveActiveId) || allPlatforms[0],
+    [allPlatforms, effectiveActiveId],
   );
 
   const currentConfig = useMemo(
@@ -80,22 +92,26 @@ const ChannelPage = memo(() => {
       <Flexbox flex={1} style={{ overflowY: 'auto' }}>
         {isLoading && <Loading debugId="ChannelPage" />}
 
-        {!isLoading && platforms && platforms.length > 0 && activePlatformDef && (
+        {!isLoading && allPlatforms.length > 0 && activePlatformDef && (
           <div className={styles.container}>
             <PlatformList
               activeId={effectiveActiveId}
               agentId={aid}
-              platforms={platforms}
+              platforms={allPlatforms}
               providers={providers}
               runtimeStatuses={platformRuntimeStatuses}
               onSelect={setActiveProviderId}
             />
-            <PlatformDetail
-              agentId={aid}
-              currentConfig={currentConfig}
-              platformDef={activePlatformDef}
-              runtimeStatus={platformRuntimeStatuses.get(activePlatformDef.id)}
-            />
+            {activePlatformDef.comingSoon ? (
+              <ComingSoonDetail platformDef={activePlatformDef} />
+            ) : (
+              <PlatformDetail
+                agentId={aid}
+                currentConfig={currentConfig}
+                platformDef={activePlatformDef}
+                runtimeStatus={platformRuntimeStatuses.get(activePlatformDef.id)}
+              />
+            )}
           </div>
         )}
       </Flexbox>
