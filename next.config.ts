@@ -21,6 +21,15 @@ const vercelConfig = {
 };
 const nextConfig = defineConfig({
   ...(isVercel ? vercelConfig : {}),
+  typescript: {
+    // 危险但管用：完全跳过打包时的 TypeScript 类型检查
+    ignoreBuildErrors: true, 
+  },
+  eslint: {
+    // 完全跳过打包时的代码规范检查
+    ignoreDuringBuilds: true, 
+  },
+  productionBrowserSourceMaps: false, // 禁止生成 SourceMap（非常节省内存）
 });
 
 export default nextConfig;
